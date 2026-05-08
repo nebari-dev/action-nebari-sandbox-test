@@ -16,7 +16,7 @@ jobs:
 
       - name: Setup Nebari Sandbox
         id: sandbox
-        uses: nebari-dev/action-nebari-sandbox@main
+        uses: nebari-dev/action-nebari-sandbox@feat/argocd-self-heal-toggle
         with:
           profile: cluster-only
           cluster-name: test-cluster
@@ -28,6 +28,29 @@ jobs:
           kubectl create deployment nginx --image=nginx:alpine --replicas=1
           kubectl wait --for=condition=Available deployment/nginx --timeout=60s
           kubectl delete deployment nginx
+
+      - name: Cleanup
+        if: always()
+        run: k3d cluster delete ${{ steps.sandbox.outputs.cluster-name }}
+
+  test-cluster-only-flag-noop:
+    name: "cluster-only + argocd-self-heal=false (silent no-op)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Nebari Sandbox
+        id: sandbox
+        uses: nebari-dev/action-nebari-sandbox@feat/argocd-self-heal-toggle
+        with:
+          profile: cluster-only
+          cluster-name: test-cluster-flag-noop
+          argocd-self-heal: "false"
+
+      - name: Verify cluster came up
+        run: |
+          kubectl get namespaces
+          kubectl get pods -n kube-system
 
       - name: Cleanup
         if: always()
@@ -56,7 +79,7 @@ jobs:
 
       - name: Setup Nebari Sandbox
         id: sandbox
-        uses: nebari-dev/action-nebari-sandbox@main
+        uses: nebari-dev/action-nebari-sandbox@feat/argocd-self-heal-toggle
         with:
           profile: platform
           cluster-name: nebari-platform-test
@@ -83,6 +106,119 @@ jobs:
           echo ""
           echo "=== Recent warning events ==="
           kubectl get events -A --field-selector type=Warning --sort-by='.lastTimestamp' 2>/dev/null | tail -30 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          k3d cluster delete ${{ steps.sandbox.outputs.cluster-name }}
+          docker network rm ${{ steps.sandbox.outputs.network-name }} 2>/dev/null || true
+
+  test-platform-self-heal-disabled:
+    name: "platform + argocd-self-heal=false (behavioral)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Cache NIC Go modules
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: nic-go-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            nic-go-${{ runner.os }}-
+
+      - name: Setup Nebari Sandbox
+        id: sandbox
+        uses: nebari-dev/action-nebari-sandbox@feat/argocd-self-heal-toggle
+        with:
+          profile: platform
+          cluster-name: nebari-self-heal-test
+          argocd-self-heal: "false"
+
+      - name: Capture original deployment image
+        id: original
+        run: |
+          # cert-manager-webhook is a small ArgoCD-managed deployment that's
+          # safe to mutate — if it crashes, nothing downstream depends on it
+          # for the duration of this test.
+          NS=cert-manager
+          DEPLOY=cert-manager-webhook
+          CONTAINER=$(kubectl get deployment "${DEPLOY}" -n "${NS}" \
+            -o jsonpath='{.spec.template.spec.containers[0].name}')
+          IMAGE=$(kubectl get deployment "${DEPLOY}" -n "${NS}" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "Target: ${NS}/${DEPLOY} container=${CONTAINER}"
+          echo "Original image: ${IMAGE}"
+          echo "namespace=${NS}" >> "$GITHUB_OUTPUT"
+          echo "deployment=${DEPLOY}" >> "$GITHUB_OUTPUT"
+          echo "container=${CONTAINER}" >> "$GITHUB_OUTPUT"
+
+      - name: Set sentinel image and verify it sticks
+        env:
+          NS: ${{ steps.original.outputs.namespace }}
+          DEPLOY: ${{ steps.original.outputs.deployment }}
+          CONTAINER: ${{ steps.original.outputs.container }}
+        run: |
+          set -euo pipefail
+          SENTINEL="ghcr.io/sentinel/image:test-$(date +%s)"
+          echo "Setting image: ${SENTINEL}"
+          kubectl set image "deployment/${DEPLOY}" \
+            "${CONTAINER}=${SENTINEL}" -n "${NS}"
+
+          # ArgoCD's default reconcile interval is 180s. Wait one full cycle
+          # plus a 60s margin so a would-be revert has time to land.
+          echo "Waiting 240s for any ArgoCD reconcile to complete..."
+          sleep 240
+
+          CURRENT=$(kubectl get deployment "${DEPLOY}" -n "${NS}" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "Current image after wait: ${CURRENT}"
+
+          if [[ "${CURRENT}" != "${SENTINEL}" ]]; then
+            echo "::error::ArgoCD reverted the image — selfHeal still active."
+            echo "Expected: ${SENTINEL}"
+            echo "Actual:   ${CURRENT}"
+            exit 1
+          fi
+
+          echo "OK: sentinel image stuck through one reconcile cycle."
+
+      - name: Verify all foundational Applications have selfHeal=false
+        run: |
+          set -euo pipefail
+          mismatched=$(kubectl get applications -n argocd -o json \
+            | jq -r '.items[]
+                | select(.spec.syncPolicy.automated != null)
+                | select(.spec.syncPolicy.automated.selfHeal != false)
+                | .metadata.name')
+          if [[ -n "${mismatched}" ]]; then
+            echo "::error::Some Applications still have selfHeal enabled:"
+            echo "${mismatched}" | sed 's/^/  /'
+            exit 1
+          fi
+          count=$(kubectl get applications -n argocd -o json \
+            | jq '[.items[] | select(.spec.syncPolicy.automated != null)] | length')
+          echo "OK: ${count} Application(s) have selfHeal=false."
+
+      - name: Debug cluster state
+        if: failure()
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -A || true
+          echo ""
+          echo "=== ArgoCD Applications ==="
+          kubectl get applications -n argocd -o wide || true
+          echo ""
+          echo "=== Application syncPolicy ==="
+          kubectl get applications -n argocd -o json \
+            | jq '.items[] | {name: .metadata.name, syncPolicy: .spec.syncPolicy}' || true
 
       - name: Cleanup
         if: always()
